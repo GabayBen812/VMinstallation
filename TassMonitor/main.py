@@ -1,0 +1,312 @@
+import os
+import sys
+import time
+from datetime import datetime
+from typing import List, Dict, Optional, Tuple
+
+import requests
+from bs4 import BeautifulSoup
+
+try:
+    # Prefer deep_translator for reliability
+    from deep_translator import GoogleTranslator  # type: ignore
+except Exception:  # pragma: no cover - fallback import guard
+    GoogleTranslator = None  # type: ignore
+
+
+# Channels to monitor (add more as needed)
+CHANNELS: List[Dict[str, str]] = [
+    {"handle": "tass_agency", "display_name": "TASS"},
+    {"handle": "Alarabiya", "display_name": "Al Arabiya"},
+    {"handle": "Aljazeera", "display_name": "Al Jazeera"},
+    {"handle": "nayaforiraq", "display_name": "OSINT"},
+    {"handle": "news_kremlin_eng", "display_name": "Kremlin News"},
+]
+
+# Discord configuration
+# Webhook is read from environment or from a local .env file at repository root.
+
+# Polling configuration
+SLEEP_SECONDS = 20
+REQUEST_TIMEOUT = 20
+HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
+    )
+}
+
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+STATE_DIR = os.path.join(BASE_DIR, "state")
+os.makedirs(STATE_DIR, exist_ok=True)
+APP_ROOT = os.path.dirname(BASE_DIR)
+
+
+def load_env_from_file(env_path: str) -> None:
+    """Minimal .env loader to support local runs (systemd loads it in prod).
+
+    Only sets variables that are not already present in the environment.
+    """
+    try:
+        if not os.path.isfile(env_path):
+            return
+        with open(env_path, "r", encoding="utf-8") as f:
+            for raw_line in f:
+                line = raw_line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                if "=" not in line:
+                    continue
+                key, value = line.split("=", 1)
+                key = key.strip()
+                value = value.strip().strip('"').strip("'")
+                if key and key not in os.environ:
+                    os.environ[key] = value
+    except Exception:
+        # Non-fatal; proceed with whatever env is available
+        pass
+
+
+# Load .env for local runs (systemd uses EnvironmentFile for services)
+load_env_from_file(os.path.join(APP_ROOT, ".env"))
+
+# Resolve webhook URL from environment
+DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL", "").strip()
+
+def channel_public_feed(handle: str) -> str:
+    return f"https://t.me/s/{handle}"
+
+
+def channel_post_url(handle: str, post_id: int) -> str:
+    return f"https://t.me/{handle}/{post_id}"
+
+
+def read_last_post_id(handle: str) -> Optional[int]:
+    state_file = os.path.join(STATE_DIR, f"last_post_id_{handle}.txt")
+    if not os.path.exists(state_file):
+        return None
+    try:
+        with open(state_file, "r", encoding="utf-8") as f:
+            value = f.read().strip()
+            return int(value) if value else None
+    except Exception:
+        return None
+
+
+def write_last_post_id(handle: str, post_id: int) -> None:
+    state_file = os.path.join(STATE_DIR, f"last_post_id_{handle}.txt")
+    try:
+        with open(state_file, "w", encoding="utf-8") as f:
+            f.write(str(post_id))
+    except Exception:
+        pass
+
+
+def fetch_channel_messages(session: requests.Session, handle: str) -> List[Dict[str, str]]:
+    """
+    Scrape the public Telegram channel page and return a list of messages.
+    Each item contains: {"id": str, "text": str, "url": str}
+    """
+    response = session.get(channel_public_feed(handle), headers=HEADERS, timeout=REQUEST_TIMEOUT)
+    response.raise_for_status()
+
+    soup = BeautifulSoup(response.text, "html.parser")
+    messages = []
+
+    for msg_div in soup.select(".tgme_widget_message_wrap"):
+        container = msg_div.find("div", class_="tgme_widget_message")
+        if not container:
+            continue
+
+        data_post = container.get("data-post")  # e.g., "handle/123456"
+        if not data_post or "/" not in data_post:
+            continue
+
+        try:
+            post_id_str = data_post.split("/")[-1]
+            post_id = int(post_id_str)
+        except Exception:
+            continue
+
+        # Extract textual content (if any)
+        text_block = container.find("div", class_="tgme_widget_message_text")
+        # Ensure line breaks are preserved
+        text = text_block.get_text("\n", strip=True) if text_block else ""
+
+        # Skip empty text if truly nothing (but still send a stub with link)
+        messages.append(
+            {
+                "id": str(post_id),
+                "text": text,
+                "url": channel_post_url(handle, post_id),
+            }
+        )
+
+    # Deduplicate, sort by id ascending
+    unique: Dict[int, Dict[str, str]] = {}
+    for m in messages:
+        try:
+            pid = int(m["id"])
+            unique[pid] = m
+        except Exception:
+            continue
+    return [unique[k] for k in sorted(unique.keys())]
+
+
+def translate_to_english(text: str) -> str:
+    if not text:
+        return ""
+    if GoogleTranslator is None:
+        return text  # Fallback: return original if translator isn't available
+    try:
+        translator = GoogleTranslator(source="auto", target="en")
+        translated = translator.translate(text)
+        return translated or text
+    except Exception:
+        return text
+
+
+def shorten(text: str, limit: int = 1800) -> str:
+    if len(text) <= limit:
+        return text
+    return text[: limit - 10].rstrip() + "\n[...]"
+
+
+def send_to_discord(content: str, username: str = "Telegram Translate Monitor") -> Tuple[bool, str]:
+    try:
+        payload = {"content": content, "username": username}
+        resp = requests.post(DISCORD_WEBHOOK_URL, json=payload, timeout=REQUEST_TIMEOUT)
+        if resp.status_code in (200, 204):
+            return True, ""
+        return False, f"HTTP {resp.status_code}: {resp.text}"
+    except Exception as e:
+        return False, str(e)
+
+
+def build_discord_message(channel_name: str, translated_text: str, post_url: str) -> str:
+    ts = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
+    translated_preview = shorten(translated_text, 1800) if translated_text else "(no text)"
+
+    parts = [
+        f"📰 [{channel_name}] {translated_preview}",
+        f"🔗 {post_url}",
+        f"`{ts}`",
+    ]
+    message = "\n".join(parts)
+    return shorten(message, 1900)
+
+
+def initialize_last_seen(session: requests.Session, handle: str) -> Optional[int]:
+    """On first run, set last seen to newest post to avoid backfilling spam."""
+    current = read_last_post_id(handle)
+    if current is not None:
+        return current
+    try:
+        msgs = fetch_channel_messages(session, handle)
+        if not msgs:
+            return None
+        newest_id = int(msgs[-1]["id"])  # messages sorted ascending
+        write_last_post_id(handle, newest_id)
+        return newest_id
+    except Exception:
+        return None
+
+
+def process_new_messages(session: requests.Session, handle: str, display_name: str) -> None:
+    last_seen = read_last_post_id(handle)
+    msgs = fetch_channel_messages(session, handle)
+    if not msgs:
+        return
+
+    # Determine new messages strictly greater than last_seen
+    if last_seen is None:
+        # If we have no state, initialize to newest and skip sending
+        initialize_last_seen(session, handle)
+        return
+
+    new_msgs = [m for m in msgs if int(m["id"]) > int(last_seen)]
+    if not new_msgs:
+        return
+
+    # Send in chronological order
+    for msg in new_msgs:
+        original = msg.get("text", "").strip()
+        translated = translate_to_english(original) if original else ""
+        content = build_discord_message(display_name, translated, msg["url"])
+        ok, err = send_to_discord(content)
+        if ok:
+            print(f"OK: Sent {handle} post {msg['id']} to Discord")
+            write_last_post_id(handle, int(msg["id"]))
+        else:
+            print(f"ERROR: Failed to send {handle} post {msg['id']}: {err}")
+
+
+def main_loop() -> None:
+    print("Starting Telegram -> Discord translate monitor (auto -> EN)...")
+    print("Channels:")
+    for ch in CHANNELS:
+        print(f"   - {ch['display_name']} (@{ch['handle']}) -> {channel_public_feed(ch['handle'])}")
+
+    # Validate configuration before proceeding
+    if not DISCORD_WEBHOOK_URL or not DISCORD_WEBHOOK_URL.startswith("https://discord.com/api/webhooks/"):
+        print("ERROR: Missing or invalid DISCORD_WEBHOOK_URL. Set it in environment or .env.")
+        return
+
+    session = requests.Session()
+
+    # Initialize on startup to avoid backfilling for all channels
+    for ch in CHANNELS:
+        initialize_last_seen(session, ch["handle"])
+
+    consecutive_errors = 0
+    MAX_CONSECUTIVE_ERRORS = 5
+
+    # Send heartbeat on startup so you know it's connected
+    hb_ok, hb_err = send_to_discord("Monitor started", username="Telegram Translate Monitor")
+    if hb_ok:
+        print("OK: Startup heartbeat sent to Discord")
+    else:
+        print(f"ERROR: Failed to send startup heartbeat: {hb_err}")
+
+    while True:
+        start = time.time()
+        try:
+            for ch in CHANNELS:
+                process_new_messages(session, ch["handle"], ch["display_name"])
+            consecutive_errors = 0
+        except Exception as e:
+            consecutive_errors += 1
+            print(f"ERROR during processing: {e}")
+            if consecutive_errors >= MAX_CONSECUTIVE_ERRORS:
+                # Send an error alert to Discord to surface issues
+                err_msg = f"Monitor encountered repeated errors (x{consecutive_errors}). Last error: {e}"
+                send_to_discord(err_msg, username="Telegram Translate Monitor")
+                consecutive_errors = 0
+        finally:
+            elapsed = time.time() - start
+            # Keep overall loop cadence roughly SLEEP_SECONDS between full scans
+            sleep_for = max(1, SLEEP_SECONDS - int(elapsed))
+            time.sleep(sleep_for)
+
+
+if __name__ == "__main__":
+    # Self-test mode: send a test message and exit
+    if "--self-test" in sys.argv:
+        load_env_from_file(os.path.join(APP_ROOT, ".env"))
+        DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL", "").strip()
+        if not DISCORD_WEBHOOK_URL:
+            print("❌ DISCORD_WEBHOOK_URL not set. Add it to .env or environment.")
+            sys.exit(1)
+        ok, err = send_to_discord("🔧 Self-test message from Telegram translate monitor", username="Telegram Translate Monitor")
+        if ok:
+            print("Self-test sent successfully")
+            sys.exit(0)
+        else:
+            print(f"Self-test failed: {err}")
+            sys.exit(2)
+
+    try:
+        main_loop()
+    except KeyboardInterrupt:
+        print("\nStopped by user")
+
