@@ -15,13 +15,39 @@ except Exception:  # pragma: no cover - fallback import guard
 
 
 # Channels to monitor (add more as needed)
+# Each channel can specify which webhook to use via "webhook" field
+# If not specified, defaults to the primary webhook (DISCORD_WEBHOOK_URL)
 CHANNELS: List[Dict[str, str]] = [
     {"handle": "tass_agency", "display_name": "TASS"},
     {"handle": "Alarabiya", "display_name": "Al Arabiya"},
     {"handle": "Aljazeera", "display_name": "Al Jazeera"},
     {"handle": "nayaforiraq", "display_name": "OSINT"},
     {"handle": "news_kremlin_eng", "display_name": "Kremlin News"},
+    # New channels with separate webhook
+    {"handle": "gazaalannet", "display_name": "Gaza Al Annet", "webhook": "secondary"},
+    {"handle": "channelnabatieh", "display_name": "Channel Nabatieh", "webhook": "secondary"},
+    {"handle": "redlinkleb", "display_name": "Red Link Lebanon", "webhook": "secondary"},
 ]
+
+# Keywords that trigger @everyone tag for the 3 new channels (gazaalannet, channelnabatieh, redlinkleb)
+# These keywords are checked in both original and translated text (case-insensitive)
+ALERT_KEYWORDS = [
+    "strike", "strikes", "striking", "struck",
+    "airstrike", "airstrikes", "air strike", "air strikes",
+    "attack", "attacks", "attacked", "attacking",
+    "casualties", "casualty", "killed", "killing", "deaths", "dead", "wounded", "injured", "injuries",
+    "bombing", "bombed", "bomb", "bombs",
+    "missile", "missiles", "rocket", "rockets",
+    "raid", "raids", "raided",
+    "shelling", "shelled", "shell",
+    "targeted", "targeting", "target",
+    "explosion", "explosions", "exploded", "explode",
+    "martyr", "martyrs", "martyred",
+    "gaza", "lebanon", "lebanese",
+]
+
+# Channels that should have keyword alert detection
+ALERT_CHANNELS = {"gazaalannet", "channelnabatieh", "redlinkleb"}
 
 # Discord configuration
 # Webhook is read from environment or from a local .env file at repository root.
@@ -70,8 +96,9 @@ def load_env_from_file(env_path: str) -> None:
 # Load .env for local runs (systemd uses EnvironmentFile for services)
 load_env_from_file(os.path.join(APP_ROOT, ".env"))
 
-# Resolve webhook URL from environment
+# Resolve webhook URLs from environment
 DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL", "").strip()
+DISCORD_WEBHOOK_URL_2 = os.getenv("DISCORD_WEBHOOK_URL_2", "").strip()
 
 def channel_public_feed(handle: str) -> str:
     return f"https://t.me/s/{handle}"
@@ -105,7 +132,7 @@ def write_last_post_id(handle: str, post_id: int) -> None:
 def fetch_channel_messages(session: requests.Session, handle: str) -> List[Dict[str, str]]:
     """
     Scrape the public Telegram channel page and return a list of messages.
-    Each item contains: {"id": str, "text": str, "url": str}
+    Each item contains: {"id": str, "text": str, "url": str, "has_image": bool}
     """
     response = session.get(channel_public_feed(handle), headers=HEADERS, timeout=REQUEST_TIMEOUT)
     response.raise_for_status()
@@ -133,12 +160,22 @@ def fetch_channel_messages(session: requests.Session, handle: str) -> List[Dict[
         # Ensure line breaks are preserved
         text = text_block.get_text("\n", strip=True) if text_block else ""
 
-        # Skip empty text if truly nothing (but still send a stub with link)
+        # Check if message has images (photos, videos, etc.)
+        # Look for common Telegram media elements
+        has_image = bool(
+            container.find("a", class_="tgme_widget_message_photo_wrap") or
+            container.find("div", class_="tgme_widget_message_video_wrap") or
+            container.find("div", class_="tgme_widget_message_document_wrap") or
+            container.find("i", class_="tgme_widget_message_photo") or
+            container.find("i", class_="tgme_widget_message_video")
+        )
+
         messages.append(
             {
                 "id": str(post_id),
                 "text": text,
                 "url": channel_post_url(handle, post_id),
+                "has_image": has_image,
             }
         )
 
@@ -172,10 +209,21 @@ def shorten(text: str, limit: int = 1800) -> str:
     return text[: limit - 10].rstrip() + "\n[...]"
 
 
-def send_to_discord(content: str, username: str = "Telegram Translate Monitor") -> Tuple[bool, str]:
+def send_to_discord(content: str, username: str = "Telegram Translate Monitor", webhook_url: Optional[str] = None) -> Tuple[bool, str]:
+    """
+    Send a message to Discord webhook.
+    
+    Args:
+        content: Message content to send
+        username: Username for the webhook message
+        webhook_url: Optional webhook URL. If None, uses DISCORD_WEBHOOK_URL
+    """
+    target_webhook = webhook_url or DISCORD_WEBHOOK_URL
+    if not target_webhook:
+        return False, "No webhook URL provided"
     try:
         payload = {"content": content, "username": username}
-        resp = requests.post(DISCORD_WEBHOOK_URL, json=payload, timeout=REQUEST_TIMEOUT)
+        resp = requests.post(target_webhook, json=payload, timeout=REQUEST_TIMEOUT)
         if resp.status_code in (200, 204):
             return True, ""
         return False, f"HTTP {resp.status_code}: {resp.text}"
@@ -183,36 +231,68 @@ def send_to_discord(content: str, username: str = "Telegram Translate Monitor") 
         return False, str(e)
 
 
-def build_discord_message(channel_name: str, translated_text: str, post_url: str) -> str:
+def check_alert_keywords(text: str) -> bool:
+    """
+    Check if any alert keywords are present in the text (case-insensitive).
+    
+    Args:
+        text: Text to check (can be original or translated)
+    
+    Returns:
+        True if any keyword is found, False otherwise
+    """
+    if not text:
+        return False
+    text_lower = text.lower()
+    return any(keyword.lower() in text_lower for keyword in ALERT_KEYWORDS)
+
+
+def build_discord_message(channel_name: str, translated_text: str, post_url: str, tag_everyone: bool = False) -> str:
     ts = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
     translated_preview = shorten(translated_text, 1800) if translated_text else "(no text)"
 
-    parts = [
+    parts = []
+    
+    # Add @everyone tag at the beginning if alert keywords detected
+    if tag_everyone:
+        parts.append("@everyone")
+    
+    parts.extend([
         f"📰 [{channel_name}] {translated_preview}",
         f"🔗 {post_url}",
         f"`{ts}`",
-    ]
+    ])
     message = "\n".join(parts)
     return shorten(message, 1900)
 
 
 def initialize_last_seen(session: requests.Session, handle: str) -> Optional[int]:
-    """On first run, set last seen to newest post to avoid backfilling spam."""
+    """On first run, set last seen to newest post to avoid backfilling spam.
+    
+    Returns:
+        The last_seen post ID (existing or newly initialized)
+        None if initialization failed
+    """
     current = read_last_post_id(handle)
     if current is not None:
+        # Already initialized, return existing value
         return current
+    
+    # First run: initialize to newest post without sending anything
     try:
         msgs = fetch_channel_messages(session, handle)
         if not msgs:
             return None
         newest_id = int(msgs[-1]["id"])  # messages sorted ascending
         write_last_post_id(handle, newest_id)
+        print(f"Initialized {handle}: starting from post {newest_id} (no old messages will be sent)")
         return newest_id
-    except Exception:
+    except Exception as e:
+        print(f"Warning: Failed to initialize {handle}: {e}")
         return None
 
 
-def process_new_messages(session: requests.Session, handle: str, display_name: str) -> None:
+def process_new_messages(session: requests.Session, handle: str, display_name: str, webhook_url: Optional[str] = None) -> None:
     last_seen = read_last_post_id(handle)
     msgs = fetch_channel_messages(session, handle)
     if not msgs:
@@ -231,11 +311,30 @@ def process_new_messages(session: requests.Session, handle: str, display_name: s
     # Send in chronological order
     for msg in new_msgs:
         original = msg.get("text", "").strip()
+        has_image = msg.get("has_image", False)
+        
+        # For @redlinkleb: skip image-only messages (images with no text)
+        if handle == "redlinkleb" and has_image and not original:
+            print(f"SKIP: {handle} post {msg['id']} is image-only (no text), ignoring")
+            # Still update last_post_id to avoid reprocessing
+            write_last_post_id(handle, int(msg["id"]))
+            continue
+        
         translated = translate_to_english(original) if original else ""
-        content = build_discord_message(display_name, translated, msg["url"])
-        ok, err = send_to_discord(content)
+        
+        # Check for alert keywords in the 3 new channels (check both original and translated)
+        tag_everyone = False
+        if handle in ALERT_CHANNELS:
+            # Check both original and translated text for keywords
+            if check_alert_keywords(original) or check_alert_keywords(translated):
+                tag_everyone = True
+                print(f"ALERT: {handle} post {msg['id']} contains alert keywords - tagging @everyone")
+        
+        content = build_discord_message(display_name, translated, msg["url"], tag_everyone=tag_everyone)
+        ok, err = send_to_discord(content, webhook_url=webhook_url)
         if ok:
-            print(f"OK: Sent {handle} post {msg['id']} to Discord")
+            alert_status = " (with @everyone)" if tag_everyone else ""
+            print(f"OK: Sent {handle} post {msg['id']} to Discord{alert_status}")
             write_last_post_id(handle, int(msg["id"]))
         else:
             print(f"ERROR: Failed to send {handle} post {msg['id']}: {err}")
@@ -245,34 +344,62 @@ def main_loop() -> None:
     print("Starting Telegram -> Discord translate monitor (auto -> EN)...")
     print("Channels:")
     for ch in CHANNELS:
-        print(f"   - {ch['display_name']} (@{ch['handle']}) -> {channel_public_feed(ch['handle'])}")
+        webhook_type = ch.get("webhook", "primary")
+        print(f"   - {ch['display_name']} (@{ch['handle']}) -> {channel_public_feed(ch['handle'])} [webhook: {webhook_type}]")
 
     # Validate configuration before proceeding
     if not DISCORD_WEBHOOK_URL or not DISCORD_WEBHOOK_URL.startswith("https://discord.com/api/webhooks/"):
         print("ERROR: Missing or invalid DISCORD_WEBHOOK_URL. Set it in environment or .env.")
         return
+    
+    # Validate secondary webhook if any channels use it
+    channels_using_secondary = [ch for ch in CHANNELS if ch.get("webhook") == "secondary"]
+    if channels_using_secondary:
+        if not DISCORD_WEBHOOK_URL_2 or not DISCORD_WEBHOOK_URL_2.startswith("https://discord.com/api/webhooks/"):
+            print("ERROR: Missing or invalid DISCORD_WEBHOOK_URL_2. Set it in environment or .env.")
+            print(f"Channels requiring secondary webhook: {', '.join([ch['handle'] for ch in channels_using_secondary])}")
+            return
 
     session = requests.Session()
 
     # Initialize on startup to avoid backfilling for all channels
+    print("Initializing channels (setting baseline to prevent old message spam)...")
     for ch in CHANNELS:
         initialize_last_seen(session, ch["handle"])
+    print("Initialization complete. Starting to monitor for NEW messages only.\n")
 
     consecutive_errors = 0
     MAX_CONSECUTIVE_ERRORS = 5
 
-    # Send heartbeat on startup so you know it's connected
-    hb_ok, hb_err = send_to_discord("Monitor started", username="Telegram Translate Monitor")
+    # Send simple startup message to Discord (only to primary webhook to avoid duplicate)
+    startup_msg = "✅ Monitor started - monitoring for new messages only"
+    hb_ok, hb_err = send_to_discord(startup_msg, username="Telegram Translate Monitor")
     if hb_ok:
-        print("OK: Startup heartbeat sent to Discord")
+        print("OK: Startup message sent to Discord")
     else:
-        print(f"ERROR: Failed to send startup heartbeat: {hb_err}")
+        print(f"WARNING: Failed to send startup message: {hb_err}")
+
+    # Re-sync all channels one more time right before starting to ensure we don't send old messages
+    # This handles any messages that might have arrived during initialization
+    print("Final sync before monitoring starts...")
+    for ch in CHANNELS:
+        try:
+            msgs = fetch_channel_messages(session, ch["handle"])
+            if msgs:
+                newest_id = int(msgs[-1]["id"])
+                write_last_post_id(ch["handle"], newest_id)
+        except Exception:
+            pass  # Non-fatal, continue with existing state
+    print("Ready to monitor. Only NEW messages will be sent.\n")
 
     while True:
         start = time.time()
         try:
             for ch in CHANNELS:
-                process_new_messages(session, ch["handle"], ch["display_name"])
+                # Determine which webhook to use for this channel
+                webhook_type = ch.get("webhook", "primary")
+                webhook_url = DISCORD_WEBHOOK_URL_2 if webhook_type == "secondary" else DISCORD_WEBHOOK_URL
+                process_new_messages(session, ch["handle"], ch["display_name"], webhook_url=webhook_url)
             consecutive_errors = 0
         except Exception as e:
             consecutive_errors += 1
@@ -303,6 +430,21 @@ if __name__ == "__main__":
             sys.exit(0)
         else:
             print(f"Self-test failed: {err}")
+            sys.exit(2)
+    
+    # Self-test mode for secondary webhook: send a test message and exit
+    if "--self-test-2" in sys.argv:
+        load_env_from_file(os.path.join(APP_ROOT, ".env"))
+        DISCORD_WEBHOOK_URL_2 = os.getenv("DISCORD_WEBHOOK_URL_2", "").strip()
+        if not DISCORD_WEBHOOK_URL_2:
+            print("❌ DISCORD_WEBHOOK_URL_2 not set. Add it to .env or environment.")
+            sys.exit(1)
+        ok, err = send_to_discord("🔧 Self-test message from Telegram translate monitor (secondary webhook)", username="Telegram Translate Monitor", webhook_url=DISCORD_WEBHOOK_URL_2)
+        if ok:
+            print("Self-test (secondary webhook) sent successfully")
+            sys.exit(0)
+        else:
+            print(f"Self-test (secondary webhook) failed: {err}")
             sys.exit(2)
 
     try:
