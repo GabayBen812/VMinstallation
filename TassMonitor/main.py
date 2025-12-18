@@ -10,7 +10,9 @@ from bs4 import BeautifulSoup
 try:
     # Prefer deep_translator for reliability
     from deep_translator import GoogleTranslator  # type: ignore
-except Exception:  # pragma: no cover - fallback import guard
+except Exception as import_error:  # pragma: no cover - fallback import guard
+    print(f"WARNING: Failed to import GoogleTranslator: {import_error}")
+    print("  Install with: pip install deep-translator")
     GoogleTranslator = None  # type: ignore
 
 from keywords_manager import get_keywords_manager
@@ -183,13 +185,55 @@ def translate_to_english(text: str) -> str:
     if not text:
         return ""
     if GoogleTranslator is None:
+        print("WARNING: GoogleTranslator is not available (deep_translator import failed)")
         return text  # Fallback: return original if translator isn't available
-    try:
-        translator = GoogleTranslator(source="auto", target="en")
-        translated = translator.translate(text)
-        return translated or text
-    except Exception:
-        return text
+    
+    # Google Translate has a character limit (usually 5000), split if needed
+    MAX_CHARS = 4500  # Leave some margin
+    if len(text) > MAX_CHARS:
+        # Split into chunks and translate separately
+        chunks = []
+        current_chunk = ""
+        for line in text.split("\n"):
+            if len(current_chunk) + len(line) + 1 > MAX_CHARS:
+                if current_chunk:
+                    chunks.append(current_chunk)
+                current_chunk = line
+            else:
+                current_chunk += ("\n" if current_chunk else "") + line
+        if current_chunk:
+            chunks.append(current_chunk)
+        
+        # Translate each chunk
+        translated_chunks = []
+        for chunk in chunks:
+            chunk_translation = translate_to_english(chunk)  # Recursive call for chunk
+            translated_chunks.append(chunk_translation)
+        return "\n".join(translated_chunks)
+    
+    # Retry logic for translation (sometimes Google Translate has temporary issues)
+    max_retries = 3
+    for attempt in range(max_retries):
+        try:
+            translator = GoogleTranslator(source="auto", target="en")
+            translated = translator.translate(text)
+            if translated and translated != text:
+                return translated
+            # If translation returned same text, might be an issue
+            if attempt < max_retries - 1:
+                time.sleep(1)  # Wait before retry
+                continue
+            return translated or text
+        except Exception as e:
+            error_msg = f"{type(e).__name__}: {e}"
+            if attempt < max_retries - 1:
+                print(f"WARNING: Translation attempt {attempt + 1} failed: {error_msg}, retrying...")
+                time.sleep(2)  # Wait before retry
+            else:
+                print(f"ERROR: Translation failed after {max_retries} attempts: {error_msg}")
+                print(f"  Original text (first 100 chars): {text[:100]}...")
+                return text
+    return text
 
 
 def shorten(text: str, limit: int = 1800) -> str:
@@ -352,6 +396,17 @@ def main_loop() -> None:
             print(f"Channels requiring secondary webhook: {', '.join([ch['handle'] for ch in channels_using_secondary])}")
             return
 
+    # Test translation functionality
+    print("Testing translation service...")
+    test_text = "مرحبا"  # Arabic for "hello"
+    test_translation = translate_to_english(test_text)
+    if test_translation == test_text:
+        print("⚠️  WARNING: Translation test failed - translations may not work!")
+        print("   The translator returned the original text instead of translating.")
+        print("   Check if deep_translator is installed: pip install deep-translator")
+    else:
+        print(f"✅ Translation test passed: '{test_text}' -> '{test_translation}'")
+    
     # Initialize keywords manager and load keywords
     keywords_manager = get_keywords_manager()
     keywords = keywords_manager.load_keywords()
