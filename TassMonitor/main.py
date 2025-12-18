@@ -13,6 +13,9 @@ try:
 except Exception:  # pragma: no cover - fallback import guard
     GoogleTranslator = None  # type: ignore
 
+from keywords_manager import get_keywords_manager
+from discord_bot import start_bot_background
+
 
 # Channels to monitor (add more as needed)
 # Each channel can specify which webhook to use via "webhook" field
@@ -29,22 +32,8 @@ CHANNELS: List[Dict[str, str]] = [
     {"handle": "redlinkleb", "display_name": "Red Link Lebanon", "webhook": "secondary"},
 ]
 
-# Keywords that trigger @everyone tag for the 3 new channels (gazaalannet, channelnabatieh, redlinkleb)
-# These keywords are checked in both original and translated text (case-insensitive)
-ALERT_KEYWORDS = [
-    "strike", "strikes", "striking", "struck",
-    "airstrike", "airstrikes", "air strike", "air strikes",
-    "attack", "attacks", "attacked", "attacking",
-    "casualties", "casualty", "killed", "killing", "deaths", "dead", "wounded", "injured", "injuries",
-    "bombing", "bombed", "bomb", "bombs",
-    "missile", "missiles", "rocket", "rockets",
-    "raid", "raids", "raided",
-    "shelling", "shelled", "shell",
-    "targeted", "targeting", "target",
-    "explosion", "explosions", "exploded", "explode",
-    "martyr", "martyrs", "martyred",
-    "gaza", "lebanon", "lebanese",
-]
+# Keywords are now loaded dynamically from Supabase via KeywordsManager
+# See keywords_manager.py for keyword storage and retrieval
 
 # Channels that should have keyword alert detection
 ALERT_CHANNELS = {"gazaalannet", "channelnabatieh", "redlinkleb"}
@@ -234,6 +223,7 @@ def send_to_discord(content: str, username: str = "Telegram Translate Monitor", 
 def check_alert_keywords(text: str) -> bool:
     """
     Check if any alert keywords are present in the text (case-insensitive).
+    Keywords are loaded dynamically from Supabase.
     
     Args:
         text: Text to check (can be original or translated)
@@ -244,7 +234,9 @@ def check_alert_keywords(text: str) -> bool:
     if not text:
         return False
     text_lower = text.lower()
-    return any(keyword.lower() in text_lower for keyword in ALERT_KEYWORDS)
+    keywords_manager = get_keywords_manager()
+    keywords = keywords_manager.load_keywords()
+    return any(keyword.lower() in text_lower for keyword in keywords)
 
 
 def build_discord_message(channel_name: str, translated_text: str, post_url: str, tag_everyone: bool = False) -> str:
@@ -359,6 +351,22 @@ def main_loop() -> None:
             print("ERROR: Missing or invalid DISCORD_WEBHOOK_URL_2. Set it in environment or .env.")
             print(f"Channels requiring secondary webhook: {', '.join([ch['handle'] for ch in channels_using_secondary])}")
             return
+
+    # Initialize keywords manager and load keywords
+    keywords_manager = get_keywords_manager()
+    keywords = keywords_manager.load_keywords()
+    print(f"Loaded {len(keywords)} alert keywords (from Supabase or defaults)")
+
+    # Start Discord bot for keyword management commands
+    discord_bot_token = os.getenv("DISCORD_BOT_TOKEN", "").strip()
+    if discord_bot_token:
+        print("Starting Discord bot for keyword management...")
+        bot_thread = start_bot_background(discord_bot_token)
+        if bot_thread:
+            print("Discord bot started successfully. Commands available: !poly setkeywords, !poly listkeywords")
+    else:
+        print("WARNING: DISCORD_BOT_TOKEN not set. Discord bot commands will not be available.")
+        print("  Set DISCORD_BOT_TOKEN in .env to enable !poly commands for keyword management.")
 
     session = requests.Session()
 
