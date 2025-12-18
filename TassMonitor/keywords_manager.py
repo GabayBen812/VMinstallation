@@ -45,14 +45,16 @@ class KeywordsManager:
             # If it doesn't exist, we'll get an error and can create it
             result = client.table("alert_keywords").select("keywords").limit(1).execute()
             return True
-        except Exception:
+        except Exception as e:
             # Table might not exist - this is expected on first run
-            # The user needs to create the table manually in Supabase
-            print("WARNING: alert_keywords table not found in Supabase.")
-            print("Please create a table named 'alert_keywords' with columns:")
-            print("  - id: integer (primary key, auto-increment)")
-            print("  - keywords: text (JSON array of keywords)")
-            print("  - updated_at: timestamp (default: now())")
+            # Only warn if Supabase is actually configured (has URL and key)
+            supabase_url = os.getenv("SUPABASE_URL", "").strip()
+            supabase_key = os.getenv("SUPABASE_KEY", "").strip()
+            if supabase_url and supabase_key:
+                # Supabase is configured but table doesn't exist - this is a setup issue
+                print("INFO: Supabase is configured but 'alert_keywords' table not found. Using default keywords.")
+                print("      To use dynamic keywords, create the table in Supabase (see SUPABASE_SETUP.md)")
+            # If Supabase isn't configured, silently use defaults (this is normal)
             return False
     
     def load_keywords(self) -> List[str]:

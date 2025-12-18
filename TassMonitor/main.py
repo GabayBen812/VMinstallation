@@ -385,7 +385,12 @@ def main_loop() -> None:
     if hb_ok:
         print("OK: Startup message sent to Discord")
     else:
-        print(f"WARNING: Failed to send startup message: {hb_err}")
+        # Check if it's a webhook token error (non-critical, monitoring will still work)
+        if "401" in hb_err or "Invalid Webhook Token" in hb_err:
+            print("INFO: Webhook token appears invalid/expired. Monitoring will continue, but startup message not sent.")
+            print("      Update DISCORD_WEBHOOK_URL in .env if you want startup notifications.")
+        else:
+            print(f"INFO: Could not send startup message: {hb_err} (monitoring will continue)")
 
     # Re-sync all channels one more time right before starting to ensure we don't send old messages
     # This handles any messages that might have arrived during initialization
