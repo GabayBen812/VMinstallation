@@ -259,9 +259,16 @@ def send_to_discord(content: str, username: str = "Telegram Translate Monitor", 
         resp = requests.post(target_webhook, json=payload, timeout=REQUEST_TIMEOUT)
         if resp.status_code in (200, 204):
             return True, ""
-        return False, f"HTTP {resp.status_code}: {resp.text}"
+        # Provide more detailed error information
+        error_detail = resp.text[:200] if resp.text else "No response body"
+        if resp.status_code == 401:
+            return False, f"HTTP 401 Unauthorized - Invalid webhook token. The webhook URL may be expired or incorrect. Response: {error_detail}"
+        elif resp.status_code == 404:
+            return False, f"HTTP 404 Not Found - Webhook not found. The webhook may have been deleted. Response: {error_detail}"
+        else:
+            return False, f"HTTP {resp.status_code}: {error_detail}"
     except Exception as e:
-        return False, str(e)
+        return False, f"Exception: {str(e)}"
 
 
 def check_alert_keywords(text: str) -> bool:
@@ -441,11 +448,18 @@ def main_loop() -> None:
         print("OK: Startup message sent to Discord")
     else:
         # Check if it's a webhook token error (non-critical, monitoring will still work)
-        if "401" in hb_err or "Invalid Webhook Token" in hb_err:
-            print("INFO: Webhook token appears invalid/expired. Monitoring will continue, but startup message not sent.")
-            print("      Update DISCORD_WEBHOOK_URL in .env if you want startup notifications.")
+        if "401" in hb_err or "Invalid Webhook Token" in hb_err or "Unauthorized" in hb_err:
+            print("⚠️  WARNING: Webhook token appears invalid/expired.")
+            print(f"   Error details: {hb_err}")
+            print("   Update DISCORD_WEBHOOK_URL in .env with a valid webhook URL.")
+            print("   Monitoring will continue, but messages won't be sent to Discord until fixed.")
+        elif "404" in hb_err or "Not Found" in hb_err:
+            print("⚠️  WARNING: Webhook not found (404).")
+            print(f"   Error details: {hb_err}")
+            print("   The webhook may have been deleted. Create a new webhook and update DISCORD_WEBHOOK_URL in .env.")
         else:
-            print(f"INFO: Could not send startup message: {hb_err} (monitoring will continue)")
+            print(f"⚠️  WARNING: Could not send startup message: {hb_err}")
+            print("   Monitoring will continue, but messages may not be sent to Discord.")
 
     # Re-sync all channels one more time right before starting to ensure we don't send old messages
     # This handles any messages that might have arrived during initialization
