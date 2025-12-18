@@ -365,6 +365,14 @@ def process_new_messages(session: requests.Session, handle: str, display_name: s
         
         translated = translate_to_english(original) if original else ""
         
+        # Debug: Log translation status (only for non-English text to avoid spam)
+        if original and translated and original != translated:
+            # Show a preview of translation working
+            orig_preview = original[:50].replace("\n", " ")
+            trans_preview = translated[:50].replace("\n", " ")
+            if orig_preview != trans_preview:
+                print(f"TRANSLATE: {handle} post {msg['id']}: '{orig_preview}...' -> '{trans_preview}...'")
+        
         # Check for alert keywords in the 3 new channels (check both original and translated)
         tag_everyone = False
         if handle in ALERT_CHANNELS:
