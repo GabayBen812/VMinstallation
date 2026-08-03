@@ -378,8 +378,8 @@ def process_new_messages(session: requests.Session, handle: str, display_name: s
         if handle in ALERT_CHANNELS:
             # Check both original and translated text for keywords
             if check_alert_keywords(original) or check_alert_keywords(translated):
-                tag_everyone = True
-                print(f"ALERT: {handle} post {msg['id']} contains alert keywords - tagging @everyone")
+                tag_everyone = False
+                print(f"ALERT: {handle} post {msg['id']} contains alert keywords - @everyone tagging disabled")
         
         content = build_discord_message(display_name, translated, msg["url"], tag_everyone=tag_everyone)
         ok, err = send_to_discord(content, webhook_url=webhook_url)
